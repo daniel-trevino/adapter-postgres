@@ -1397,7 +1397,7 @@ var postgresAdapter = {
 // src/index.ts
 var postgresPlugin = {
   name: "postgres",
-  description: "PostgreSQL database adapter plugin",
+  description: "Custom PostgreSQL database adapter plugin",
   adapters: [postgresAdapter]
 };
 var index_default = postgresPlugin;
