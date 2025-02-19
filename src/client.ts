@@ -979,31 +979,31 @@ class PostgresDatabaseAdapter
 				});
 
 				const sql = `
-                    WITH content_text AS (
-                        SELECT
-                            embedding,
-                            COALESCE(
-                                content->>$2,
-                                ''
-                            ) as content_text
-                        FROM memories
-                        WHERE type = $3
-                        AND content->>$2 IS NOT NULL
-                    )
-                    SELECT
-                        embedding,
-                        levenshtein(
-                            $1,
-                            content_text
-                        ) as levenshtein_score
-                    FROM content_text
-                    WHERE levenshtein(
-                        $1,
-                        content_text
-                    ) <= $5  -- Add threshold check
-                    ORDER BY levenshtein_score
-                    LIMIT $4
-                `;
+						WITH content_text AS (
+								SELECT
+										embedding,
+										COALESCE(
+												content->>$2,
+												''
+										) as content_text
+								FROM memories
+								WHERE type = $3
+								AND content->>$2 IS NOT NULL
+						)
+						SELECT
+								embedding,
+								levenshtein(
+										left($1, 255),
+										left(content_text, 255)
+								) as levenshtein_score
+						FROM content_text
+						WHERE levenshtein(
+								left($1, 255),
+								left(content_text, 255)
+						) <= $5
+						ORDER BY levenshtein_score
+						LIMIT $4;
+				`;
 
 				const { rows } = await this.pool.query(sql, [
 					opts.query_input,
