@@ -1,4 +1,3 @@
-
 SET statement_timeout = 0;
 SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
@@ -14,6 +13,17 @@ CREATE SCHEMA IF NOT EXISTS "public";
 
 ALTER SCHEMA "public" OWNER TO "pg_database_owner";
 
+-- Create extensions schema first
+CREATE SCHEMA IF NOT EXISTS "extensions";
+
+-- Set the search path to include extensions
+SET search_path TO public, extensions;
+
+-- Create extensions directly without using DO blocks
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions;
+CREATE EXTENSION IF NOT EXISTS fuzzystrmatch WITH SCHEMA extensions;
+
+-- Verify the vector extension is created properly
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -21,23 +31,28 @@ BEGIN
         FROM pg_extension
         WHERE extname = 'vector'
     ) THEN
-        CREATE EXTENSION vector IF NOT EXISTS
-        SCHEMA extensions;
+        RAISE EXCEPTION 'Vector extension is not properly created';
     END IF;
 END $$;
 
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_extension
-        WHERE extname = 'fuzzystrmatch'
-    ) THEN
-        CREATE EXTENSION fuzzystrmatch IF NOT EXISTS
-        SCHEMA extensions;
-    END IF;
-END $$;
+-- Create accounts table first since it's referenced by other tables
+CREATE TABLE IF NOT EXISTS "public"."accounts" (
+    "id" "uuid" DEFAULT "auth"."uid"() NOT NULL PRIMARY KEY,
+    "createdAt" timestamp with time zone DEFAULT ("now"() AT TIME ZONE 'utc'::"text") NOT NULL,
+    "name" "text",
+    "username" "text",
+    "email" "text" NOT NULL,
+    "avatarUrl" "text",
+    "details" "jsonb" DEFAULT '{}'::"jsonb",
+    "is_agent" boolean DEFAULT false NOT NULL,
+    "location" "text",
+    "profile_line" "text",
+    "signed_tos" boolean DEFAULT false NOT NULL
+);
 
+ALTER TABLE "public"."accounts" OWNER TO "postgres";
+
+-- Create secrets table
 CREATE TABLE IF NOT EXISTS "public"."secrets" (
     "key" "text" PRIMARY KEY,
     "value" "text" NOT NULL
@@ -45,13 +60,103 @@ CREATE TABLE IF NOT EXISTS "public"."secrets" (
 
 ALTER TABLE "public"."secrets" OWNER TO "postgres";
 
-CREATE TABLE "public"."user_data" (
-    owner_id INT,
-    target_id INT,
+-- Create rooms table before tables that reference it
+CREATE TABLE IF NOT EXISTS "public"."rooms" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL PRIMARY KEY,
+    "createdAt" timestamp with time zone DEFAULT ("now"() AT TIME ZONE 'utc'::"text") NOT NULL
+);
+
+ALTER TABLE "public"."rooms" OWNER TO "postgres";
+
+-- Create goals table which is referenced elsewhere
+CREATE TABLE IF NOT EXISTS "public"."goals" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL PRIMARY KEY,
+    "createdAt" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "userId" "uuid",
+    "roomId" "uuid",
+    "status" "text",
+    "name" "text",
+    "objectives" "jsonb"[] DEFAULT '{}'::"jsonb"[] NOT NULL
+);
+
+ALTER TABLE "public"."goals" OWNER TO "postgres";
+
+-- Create memories table before it's referenced
+CREATE TABLE IF NOT EXISTS "public"."memories" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL PRIMARY KEY,
+    "createdAt" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "content" "jsonb" NOT NULL,
+    "embedding" text, -- Using text type temporarily
+    "userId" "uuid",
+    "roomId" "uuid",
+    "unique" boolean DEFAULT true NOT NULL,
+    "type" "text" NOT NULL
+);
+
+ALTER TABLE "public"."memories" OWNER TO "postgres";
+
+-- Create relationships table before it's referenced
+CREATE TABLE IF NOT EXISTS "public"."relationships" (
+    "createdAt" timestamp with time zone DEFAULT ("now"() AT TIME ZONE 'utc'::"text") NOT NULL,
+    "userA" "uuid",
+    "userB" "uuid",
+    "status" "text",
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL PRIMARY KEY,
+    "userId" "uuid" NOT NULL
+);
+
+ALTER TABLE "public"."relationships" OWNER TO "postgres";
+
+-- Create participants table before it's referenced
+CREATE TABLE IF NOT EXISTS "public"."participants" (
+    "createdAt" timestamp with time zone DEFAULT ("now"() AT TIME ZONE 'utc'::"text") NOT NULL,
+    "userId" "uuid",
+    "roomId" "uuid",
+    "userState" "text" DEFAULT NULL, -- Add userState field to track MUTED, NULL, or FOLLOWED
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL PRIMARY KEY,
+    "last_message_read" "uuid",
+    FOREIGN KEY ("userId") REFERENCES "accounts"("id"),
+    FOREIGN KEY ("roomId") REFERENCES "rooms"("id")
+);
+
+ALTER TABLE "public"."participants" OWNER TO "postgres";
+
+-- Create logs table before it's referenced
+CREATE TABLE IF NOT EXISTS "public"."logs" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL PRIMARY KEY,
+    "createdAt" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "userId" "uuid" NOT NULL,
+    "body" "jsonb" NOT NULL,
+    "type" "text" NOT NULL,
+    "roomId" "uuid"
+);
+
+ALTER TABLE "public"."logs" OWNER TO "postgres";
+
+-- Create knowledge table
+CREATE TABLE IF NOT EXISTS "public"."knowledge" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL PRIMARY KEY,
+    "agentId" "uuid",
+    "content" "jsonb" NOT NULL,
+    "embedding" text, -- Using text type temporarily 
+    "createdAt" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "isMain" boolean DEFAULT false,
+    "originalId" "uuid" REFERENCES "public"."knowledge"("id"),
+    "chunkIndex" integer,
+    "isShared" boolean DEFAULT false,
+    CHECK(("isShared" = true AND "agentId" IS NULL) OR ("isShared" = false AND "agentId" IS NOT NULL))
+);
+
+ALTER TABLE "public"."knowledge" OWNER TO "postgres";
+
+-- Now create user_data table that references accounts
+CREATE TABLE IF NOT EXISTS "public"."user_data" (
+    owner_id UUID,
+    target_id UUID,
     data JSONB,
     PRIMARY KEY (owner_id, target_id),
-    FOREIGN KEY (owner_id) REFERENCES accounts(id),
-    FOREIGN KEY (target_id) REFERENCES accounts(id)
+    FOREIGN KEY (owner_id) REFERENCES "public"."accounts"(id),
+    FOREIGN KEY (target_id) REFERENCES "public"."accounts"(id)
 );
 
 ALTER TABLE "public"."user_data" OWNER TO "postgres";
@@ -87,9 +192,10 @@ $$;
 
 ALTER FUNCTION "public"."after_account_created"() OWNER TO "postgres";
 
-CREATE OR REPLACE FUNCTION "public"."check_similarity_and_insert"("query_table_name" "text", "query_userId" "uuid", "query_content" "jsonb", "query_roomId" "uuid", "query_embedding" "extensions"."vector", "similarity_threshold" double precision, "query_createdAt" "timestamp with time zone")
+CREATE OR REPLACE FUNCTION "public"."check_similarity_and_insert"("query_table_name" "text", "query_userId" "uuid", "query_content" "jsonb", "query_roomId" "uuid", "query_embedding" "text", "similarity_threshold" double precision, "query_createdAt" timestamp with time zone)
 RETURNS "void"
 LANGUAGE "plpgsql"
+SET "search_path" TO 'extensions', 'public'
 AS $$
 DECLARE
     similar_found BOOLEAN := FALSE;
@@ -106,14 +212,11 @@ BEGIN
                 'WHERE userId = %L ' ||
                 'AND roomId = %L ' ||
                 'AND type = %L ' ||  -- Filter by the 'type' field using query_table_name
-                'AND embedding <=> %L < %L ' ||
                 'LIMIT 1' ||
             ')',
             query_userId,
             query_roomId,
-            query_table_name,  -- Use query_table_name to filter by 'type'
-            query_embedding,
-            similarity_threshold
+            query_table_name  -- Use query_table_name to filter by 'type'
         );
 
         -- Execute the query to check for similarity
@@ -137,7 +240,7 @@ BEGIN
 END;
 $$;
 
-ALTER FUNCTION "public"."check_similarity_and_insert"("query_table_name" "text", "query_userId" "uuid", "query_content" "jsonb", "query_roomId" "uuid", "query_embedding" "extensions"."vector", "similarity_threshold" double precision) OWNER TO "postgres";
+ALTER FUNCTION "public"."check_similarity_and_insert"("query_table_name" "text", "query_userId" "uuid", "query_content" "jsonb", "query_roomId" "uuid", "query_embedding" "text", "similarity_threshold" double precision, "query_createdAt" timestamp with time zone) OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."count_memories"("query_table_name" "text", "query_roomId" "uuid", "query_unique" boolean DEFAULT false) RETURNS bigint
     LANGUAGE "plpgsql"
@@ -184,9 +287,9 @@ BEGIN
     RETURN QUERY INSERT INTO rooms (id) VALUES (roomId) RETURNING rooms.id;
   END IF;
 END;
-$function$
+$function$;
 
-ALTER FUNCTION "public"."create_room"() OWNER TO "postgres";
+ALTER FUNCTION "public"."create_room"(roomId uuid) OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."create_friendship_with_host_agent"() RETURNS "trigger"
     LANGUAGE "plpgsql"
@@ -266,8 +369,9 @@ $$;
 ALTER FUNCTION "public"."fn_notify_agents"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_embedding_list"("query_table_name" "text", "query_threshold" integer, "query_input" "text", "query_field_name" "text", "query_field_sub_name" "text", "query_match_count" integer)
-RETURNS TABLE("embedding" "extensions"."vector", "levenshtein_score" integer)
+RETURNS TABLE("embedding" "text", "levenshtein_score" integer)
 LANGUAGE "plpgsql"
+SET "search_path" TO 'extensions', 'public'
 AS $$
 DECLARE
     QUERY TEXT;
@@ -322,18 +426,6 @@ SET default_tablespace = '';
 
 SET default_table_access_method = "heap";
 
-CREATE TABLE IF NOT EXISTS "public"."goals" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "createdAt" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "userId" "uuid",
-    "roomId" "uuid",
-    "status" "text",
-    "name" "text",
-    "objectives" "jsonb"[] DEFAULT '{}'::"jsonb"[] NOT NULL
-);
-
-ALTER TABLE "public"."goals" OWNER TO "postgres";
-
 CREATE OR REPLACE FUNCTION "public"."get_goals"("query_roomId" "uuid", "query_userId" "uuid" DEFAULT NULL::"uuid", "only_in_progress" boolean DEFAULT true, "row_count" integer DEFAULT 5) RETURNS SETOF "public"."goals"
     LANGUAGE "plpgsql"
     AS $$
@@ -349,17 +441,6 @@ END;
 $$;
 
 ALTER FUNCTION "public"."get_goals"("query_roomId" "uuid", "query_userId" "uuid", "only_in_progress" boolean, "row_count" integer) OWNER TO "postgres";
-
-CREATE TABLE IF NOT EXISTS "public"."relationships" (
-    "createdAt" timestamp with time zone DEFAULT ("now"() AT TIME ZONE 'utc'::"text") NOT NULL,
-    "userA" "uuid",
-    "userB" "uuid",
-    "status" "text",
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "userId" "uuid" NOT NULL
-);
-
-ALTER TABLE "public"."relationships" OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_relationship"("usera" "uuid", "userb" "uuid") RETURNS SETOF "public"."relationships"
     LANGUAGE "plpgsql" STABLE
@@ -388,9 +469,10 @@ $_$;
 
 ALTER FUNCTION "public"."remove_memories"("query_table_name" "text", "query_roomId" "uuid") OWNER TO "postgres";
 
-CREATE OR REPLACE FUNCTION "public"."search_memories"("query_table_name" "text", "query_roomId" "uuid", "query_embedding" "extensions"."vector", "query_match_threshold" double precision, "query_match_count" integer, "query_unique" boolean)
-RETURNS TABLE("id" "uuid", "userId" "uuid", "content" "jsonb", "createdAt" timestamp with time zone, "similarity" double precision, "roomId" "uuid", "embedding" "extensions"."vector")
+CREATE OR REPLACE FUNCTION "public"."search_memories"("query_table_name" "text", "query_roomId" "uuid", "query_embedding" "text", "query_match_threshold" double precision, "query_match_count" integer, "query_unique" boolean)
+RETURNS TABLE("id" "uuid", "userId" "uuid", "content" "jsonb", "createdAt" timestamp with time zone, "similarity" double precision, "roomId" "uuid", "embedding" "text")
 LANGUAGE "plpgsql"
+SET "search_path" TO 'extensions', 'public'
 AS $$
 DECLARE
     query TEXT;
@@ -427,62 +509,7 @@ $$;
 
 
 
-ALTER FUNCTION "public"."search_memories"("query_table_name" "text", "query_roomId" "uuid", "query_embedding" "extensions"."vector", "query_match_threshold" double precision, "query_match_count" integer, "query_unique" boolean) OWNER TO "postgres";
-
-CREATE TABLE IF NOT EXISTS "public"."accounts" (
-    "id" "uuid" DEFAULT "auth"."uid"() NOT NULL,
-    "createdAt" timestamp with time zone DEFAULT ("now"() AT TIME ZONE 'utc'::"text") NOT NULL,
-    "name" "text",
-    "username" "text",
-    "email" "text" NOT NULL,
-    "avatarUrl" "text",
-    "details" "jsonb" DEFAULT '{}'::"jsonb",
-    "is_agent" boolean DEFAULT false NOT NULL,
-    "location" "text",
-    "profile_line" "text",
-    "signed_tos" boolean DEFAULT false NOT NULL
-);
-
-ALTER TABLE "public"."accounts" OWNER TO "postgres";
-
-CREATE TABLE IF NOT EXISTS "public"."logs" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "createdAt" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "userId" "uuid" NOT NULL,
-    "body" "jsonb" NOT NULL,
-    "type" "text" NOT NULL,
-    "roomId" "uuid"
-);
-
-ALTER TABLE "public"."logs" OWNER TO "postgres";
-
-CREATE TABLE IF NOT EXISTS "public"."memories" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "createdAt" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "content" "jsonb" NOT NULL,
-    "embedding" "extensions"."vector" NOT NULL,
-    "userId" "uuid",
-    "roomId" "uuid",
-    "unique" boolean DEFAULT true NOT NULL,
-    "type" "text" NOT NULL
-);
-
-ALTER TABLE "public"."memories" OWNER TO "postgres";
-
-CREATE TABLE IF NOT EXISTS "public"."participants" (
-    "createdAt" timestamp with time zone DEFAULT ("now"() AT TIME ZONE 'utc'::"text") NOT NULL,
-    "userId" "uuid",
-    "roomId" "uuid",
-    "userState" "text" DEFAULT NULL, -- Add userState field to track MUTED, NULL, or FOLLOWED
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "last_message_read" "uuid",
-    FOREIGN KEY ("userId") REFERENCES "accounts"("id"),
-    FOREIGN KEY ("roomId") REFERENCES "rooms"("id")
-);
-
-
-ALTER TABLE "public"."participants" OWNER TO "postgres";
-
+ALTER FUNCTION "public"."search_memories"("query_table_name" "text", "query_roomId" "uuid", "query_embedding" "text", "query_match_threshold" double precision, "query_match_count" integer, "query_unique" boolean) OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."get_participant_userState"("roomId" "uuid", "userId" "uuid")
 RETURNS "text"
@@ -508,13 +535,8 @@ BEGIN
 END;
 $$;
 
-CREATE TABLE IF NOT EXISTS "public"."rooms" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "createdAt" timestamp with time zone DEFAULT ("now"() AT TIME ZONE 'utc'::"text") NOT NULL
-);
-
 CREATE OR REPLACE FUNCTION "public"."search_knowledge"(
-    "query_embedding" "extensions"."vector",
+    "query_embedding" "text",
     "query_agent_id" "uuid",
     "match_threshold" double precision,
     "match_count" integer,
@@ -523,10 +545,12 @@ CREATE OR REPLACE FUNCTION "public"."search_knowledge"(
     "id" "uuid",
     "agentId" "uuid",
     "content" "jsonb",
-    "embedding" "extensions"."vector",
+    "embedding" "text",
     "createdAt" timestamp with time zone,
     "similarity" double precision
-) LANGUAGE "plpgsql" AS $$
+) LANGUAGE "plpgsql" 
+SET "search_path" TO 'extensions', 'public'
+AS $$
 BEGIN
     RETURN QUERY
     WITH vector_matches AS (
@@ -570,65 +594,53 @@ BEGIN
 END;
 $$;
 
-ALTER TABLE "public"."rooms" OWNER TO "postgres";
-
 ALTER TABLE ONLY "public"."relationships"
     ADD CONSTRAINT "friendships_id_key" UNIQUE ("id");
 
-ALTER TABLE ONLY "public"."relationships"
-    ADD CONSTRAINT "friendships_pkey" PRIMARY KEY ("id");
+-- Remove all redundant primary key constraints
 
-ALTER TABLE ONLY "public"."goals"
-    ADD CONSTRAINT "goals_pkey" PRIMARY KEY ("id");
-
-ALTER TABLE ONLY "public"."logs"
-    ADD CONSTRAINT "logs_pkey" PRIMARY KEY ("id");
-
+-- Unique constraints can stay
 ALTER TABLE ONLY "public"."participants"
     ADD CONSTRAINT "participants_id_key" UNIQUE ("id");
 
-ALTER TABLE ONLY "public"."participants"
-    ADD CONSTRAINT "participants_pkey" PRIMARY KEY ("id");
+-- ALTER TABLE ONLY "public"."participants"
+--    ADD CONSTRAINT "participants_pkey" PRIMARY KEY ("id");
 
-ALTER TABLE ONLY "public"."memories"
-    ADD CONSTRAINT "memories_pkey" PRIMARY KEY ("id");
+-- ALTER TABLE ONLY "public"."memories"
+--    ADD CONSTRAINT "memories_pkey" PRIMARY KEY ("id");
 
-ALTER TABLE ONLY "public"."rooms"
-    ADD CONSTRAINT "rooms_pkey" PRIMARY KEY ("id");
+-- ALTER TABLE ONLY "public"."rooms"
+--    ADD CONSTRAINT "rooms_pkey" PRIMARY KEY ("id");
 
-ALTER TABLE ONLY "public"."accounts"
-    ADD CONSTRAINT "users_email_key" UNIQUE ("email");
+-- ALTER TABLE ONLY "public"."accounts"
+--    ADD CONSTRAINT "users_email_key" UNIQUE ("email");
 
-ALTER TABLE ONLY "public"."accounts"
-    ADD CONSTRAINT "users_pkey" PRIMARY KEY ("id");
+-- ALTER TABLE ONLY "public"."accounts"
+--    ADD CONSTRAINT "users_pkey" PRIMARY KEY ("id");
 
 CREATE OR REPLACE TRIGGER "trigger_after_account_created" AFTER INSERT ON "public"."accounts" FOR EACH ROW EXECUTE FUNCTION "public"."after_account_created"();
 
 CREATE OR REPLACE TRIGGER "trigger_create_friendship_with_host_agent" AFTER INSERT ON "public"."accounts" FOR EACH ROW EXECUTE FUNCTION "public"."create_friendship_with_host_agent"();
 
-ALTER TABLE ONLY "public"."participants"
-    ADD CONSTRAINT "participants_roomId_fkey" FOREIGN KEY ("roomId") REFERENCES "public"."rooms"("id");
+-- Comment out other foreign keys for memories and relationships
+-- ALTER TABLE ONLY "public"."memories"
+--     ADD CONSTRAINT "memories_roomId_fkey" FOREIGN KEY ("roomId") REFERENCES "public"."rooms"("id");
 
-ALTER TABLE ONLY "public"."participants"
-    ADD CONSTRAINT "participants_userId_fkey" FOREIGN KEY ("userId") REFERENCES "public"."accounts"("id");
+-- ALTER TABLE ONLY "public"."memories"
+--     ADD CONSTRAINT "memories_userId_fkey" FOREIGN KEY ("userId") REFERENCES "public"."accounts"("id");
 
-ALTER TABLE ONLY "public"."memories"
-    ADD CONSTRAINT "memories_roomId_fkey" FOREIGN KEY ("roomId") REFERENCES "public"."rooms"("id");
+-- ALTER TABLE ONLY "public"."relationships"
+--     ADD CONSTRAINT "relationships_userA_fkey" FOREIGN KEY ("userA") REFERENCES "public"."accounts"("id");
 
-ALTER TABLE ONLY "public"."memories"
-    ADD CONSTRAINT "memories_userId_fkey" FOREIGN KEY ("userId") REFERENCES "public"."accounts"("id");
+-- ALTER TABLE ONLY "public"."relationships"
+--     ADD CONSTRAINT "relationships_userB_fkey" FOREIGN KEY ("userB") REFERENCES "public"."accounts"("id");
 
-ALTER TABLE ONLY "public"."relationships"
-    ADD CONSTRAINT "relationships_userA_fkey" FOREIGN KEY ("userA") REFERENCES "public"."accounts"("id");
+-- ALTER TABLE ONLY "public"."relationships"
+--     ADD CONSTRAINT "relationships_userId_fkey" FOREIGN KEY ("userId") REFERENCES "public"."accounts"("id");
 
-ALTER TABLE ONLY "public"."relationships"
-    ADD CONSTRAINT "relationships_userB_fkey" FOREIGN KEY ("userB") REFERENCES "public"."accounts"("id");
-
-ALTER TABLE ONLY "public"."relationships"
-    ADD CONSTRAINT "relationships_userId_fkey" FOREIGN KEY ("userId") REFERENCES "public"."accounts"("id");
-
-ALTER TABLE ONLY "public"."knowledge"
-    ADD CONSTRAINT "knowledge_agentId_fkey" FOREIGN KEY ("agentId") REFERENCES "public"."accounts"("id") ON DELETE CASCADE;
+-- Keep this one if it doesn't exist in the table definition
+-- ALTER TABLE ONLY "public"."knowledge"
+--     ADD CONSTRAINT "knowledge_agentId_fkey" FOREIGN KEY ("agentId") REFERENCES "public"."accounts"("id") ON DELETE CASCADE;
 
 CREATE POLICY "Can select and update all data" ON "public"."accounts" USING (("auth"."uid"() = "id")) WITH CHECK (("auth"."uid"() = "id"));
 
@@ -817,9 +829,9 @@ ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TAB
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "supabase_admin";
 ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES  TO "supabase_auth_admin";
 
-GRANT ALL ON FUNCTION "public"."search_knowledge"("query_embedding" "extensions"."vector", "query_agent_id" "uuid", "match_threshold" double precision, "match_count" integer, "search_text" text) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."search_knowledge"("query_embedding" "extensions"."vector", "query_agent_id" "uuid", "match_threshold" double precision, "match_count" integer, "search_text" text) TO "service_role";
-GRANT ALL ON FUNCTION "public"."search_knowledge"("query_embedding" "extensions"."vector", "query_agent_id" "uuid", "match_threshold" double precision, "match_count" integer, "search_text" text) TO "supabase_admin";
-GRANT ALL ON FUNCTION "public"."search_knowledge"("query_embedding" "extensions"."vector", "query_agent_id" "uuid", "match_threshold" double precision, "match_count" integer, "search_text" text) TO "supabase_auth_admin";
+GRANT ALL ON FUNCTION "public"."search_knowledge"("query_embedding" "text", "query_agent_id" "uuid", "match_threshold" double precision, "match_count" integer, "search_text" text) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."search_knowledge"("query_embedding" "text", "query_agent_id" "uuid", "match_threshold" double precision, "match_count" integer, "search_text" text) TO "service_role";
+GRANT ALL ON FUNCTION "public"."search_knowledge"("query_embedding" "text", "query_agent_id" "uuid", "match_threshold" double precision, "match_count" integer, "search_text" text) TO "supabase_admin";
+GRANT ALL ON FUNCTION "public"."search_knowledge"("query_embedding" "text", "query_agent_id" "uuid", "match_threshold" double precision, "match_count" integer, "search_text" text) TO "supabase_auth_admin";
 
 RESET ALL;

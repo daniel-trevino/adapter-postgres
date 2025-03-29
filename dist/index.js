@@ -773,13 +773,13 @@ var PostgresDatabaseAdapter = class extends DatabaseAdapter {
                     SELECT
                         embedding,
                         levenshtein(
-                            $1,
-                            content_text
+                            LEFT($1, 255),
+                            LEFT(content_text, 255)
                         ) as levenshtein_score
                     FROM content_text
                     WHERE levenshtein(
-                        $1,
-                        content_text
+                      LEFT($1, 255),
+                      LEFT(content_text, 255)
                     ) <= $5  -- Add threshold check
                     ORDER BY levenshtein_score
                     LIMIT $4
@@ -1414,6 +1414,7 @@ var postgresPlugin = {
 };
 var index_default = postgresPlugin;
 export {
+  PostgresDatabaseAdapter,
   index_default as default
 };
 //# sourceMappingURL=index.js.map

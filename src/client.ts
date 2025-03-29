@@ -36,7 +36,7 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url); // get the resolved path to the file
 const __dirname = path.dirname(__filename); // get the name of the directory
 
-class PostgresDatabaseAdapter
+export class PostgresDatabaseAdapter
     extends DatabaseAdapter<Pool>
     implements IDatabaseCacheAdapter
 {
@@ -1029,13 +1029,13 @@ class PostgresDatabaseAdapter
                     SELECT
                         embedding,
                         levenshtein(
-                            $1,
-                            content_text
+                            LEFT($1, 255),
+                            LEFT(content_text, 255)
                         ) as levenshtein_score
                     FROM content_text
                     WHERE levenshtein(
-                        $1,
-                        content_text
+                      LEFT($1, 255),
+                      LEFT(content_text, 255)
                     ) <= $5  -- Add threshold check
                     ORDER BY levenshtein_score
                     LIMIT $4
